@@ -1,0 +1,393 @@
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <DHT.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+// Sensor Definitions
+#define DHTPIN 27
+#define DHTTYPE DHT11
+#define IR_SENSOR_PIN 14
+#define BUZZER_PIN 25
+#define LED_PIN 26
+
+// Thresholds
+#define HIGH_HEART_RATE 120
+#define LOW_HEART_RATE 45
+#define HIGH_TEMP 39.0
+#define LOW_TEMP 34.0
+#define LOW_SPO2 90.0
+#define FALL_THRESHOLD 20.0
+
+// Objects
+MAX30105 particleSensor;
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+
+// GSM and GPS Setup
+SoftwareSerial gsmSerial(16, 17); // RX, TX for SIM800L
+SoftwareSerial gpsSerial(4, 5);   // RX, TX for NEO-6M GPS
+
+// System Variables
+const char* phoneNumbers[] = {"+919037360398"}; // Replace with emergency contact
+bool deviceWorn = false;
+bool emergencyTriggered = false;
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 2000;
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_INTERVAL = 1000;
+unsigned long lastGpsUpdate = 0;
+const unsigned long GPS_INTERVAL = 5000;
+
+// Health Metrics
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg;
+float spo2Value = 0.0;
+
+// Environmental Data
+float currentTemp = 0.0;
+float currentHumidity = 0.0;
+
+// GPS Data
+float gpsLatitude = 0.0;
+float gpsLongitude = 0.0;
+bool gpsValid = false;
+String googleMapsLink = "";
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("==========================================");
+  Serial.println("    ELDERLY MONITORING SYSTEM v3.0       ");
+  Serial.println("==========================================");
+  
+  Wire.begin();
+  gsmSerial.begin(9600);
+  gpsSerial.begin(9600);
+  
+  // Initialize all sensors
+  initMAX30102();
+  initDHT11();
+  initMPU6050();
+  
+  // Configure pins
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(IR_SENSOR_PIN, INPUT);
+  
+  // Test alerts and GSM
+  testAlerts();
+  initGSM();
+  
+  Serial.println("\nSystem Ready - Waiting for device to be worn...");
+  Serial.println("------------------------------------------");
+}
+
+void loop() {
+  checkDeviceStatus();
+  
+  // Read GPS data
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      updateGPSData();
+    }
+  }
+  
+  if (!deviceWorn) {
+    delay(500);
+    return;
+  }
+  
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+    lastSensorRead = millis();
+    readAllSensors();
+    checkEmergencies();
+  }
+  
+  if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+    lastDisplayUpdate = millis();
+    displayReadings();
+  }
+  
+  if (emergencyTriggered) {
+    handleEmergency();
+  }
+  
+  delay(10);
+}
+
+void updateGPSData() {
+  if (gps.location.isValid()) {
+    gpsLatitude = gps.location.lat();
+    gpsLongitude = gps.location.lng();
+    gpsValid = true;
+    
+    // Generate Google Maps link
+    googleMapsLink = "http://maps.google.com/maps?q=" + String(gpsLatitude, 6) + "," + String(gpsLongitude, 6);
+    
+    if (millis() - lastGpsUpdate >= GPS_INTERVAL) {
+      lastGpsUpdate = millis();
+      Serial.println("GPS Updated: " + googleMapsLink);
+    }
+  } else {
+    gpsValid = false;
+    googleMapsLink = "GPS signal not available";
+  }
+}
+
+// Sensor Initialization Functions (same as before)
+void initMAX30102() {
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found!");
+    while(1);
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x3F);
+  particleSensor.setPulseAmplitudeIR(0x3F);
+  Serial.println("- MAX30102 Initialized");
+}
+
+void initDHT11() {
+  dht.begin();
+  delay(2000);
+  if (isnan(dht.readTemperature())) {
+    Serial.println("- DHT11 Initialization Failed!");
+  } else {
+    Serial.println("- DHT11 Initialized");
+  }
+}
+
+void initMPU6050() {
+  if (!mpu.begin()) {
+    Serial.println("- MPU6050 not found!");
+    while(1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("- MPU6050 Initialized");
+}
+
+void initGSM() {
+  delay(1000);
+  gsmSerial.println("AT");
+  delay(1000);
+  gsmSerial.println("AT+CMGF=1");
+  delay(1000);
+  Serial.println("- GSM Module Ready");
+}
+
+// Core Functions (updated with GPS)
+void checkEmergencies() {
+  if (beatsPerMinute > HIGH_HEART_RATE || beatsPerMinute < LOW_HEART_RATE) {
+    triggerEmergency("Abnormal Heart Rate");
+  }
+  
+  if (spo2Value < LOW_SPO2 && spo2Value > 0) {
+    triggerEmergency("Low Blood Oxygen");
+  }
+  
+  if (!isnan(currentTemp)) {
+    if (currentTemp > HIGH_TEMP) {
+      triggerEmergency("High Temperature");
+    } else if (currentTemp < LOW_TEMP) {
+      triggerEmergency("Low Temperature");
+    }
+  }
+}
+
+void triggerEmergency(String reason) {
+  if (emergencyTriggered) return;
+  
+  emergencyTriggered = true;
+  Serial.println("\n!!! EMERGENCY ALERT !!!");
+  Serial.println("Reason: " + reason);
+  
+  String message = "EMERGENCY ALERT!\n";
+  message += "Reason: " + reason + "\n\n";
+  message += "VITAL SIGNS:\n";
+  message += "- Heart Rate: " + String(beatsPerMinute) + " BPM\n";
+  message += "- SpO2: " + String(spo2Value) + "%\n\n";
+  message += "ENVIRONMENT:\n";
+  message += "- Temperature: " + String(currentTemp) + "°C\n";
+  message += "- Humidity: " + String(currentHumidity) + "%\n\n";
+  
+  if (gpsValid) {
+    message += "LOCATION:\n";
+    message += "- Latitude: " + String(gpsLatitude, 6) + "\n";
+    message += "- Longitude: " + String(gpsLongitude, 6) + "\n";
+    message += "- Google Maps: " + googleMapsLink + "\n";
+  } else {
+    message += "LOCATION: GPS signal not available\n";
+  }
+  
+  message += "\nPlease check on the person immediately!";
+  
+  for (int i = 0; i < sizeof(phoneNumbers)/sizeof(phoneNumbers[0]); i++) {
+    sendAlert(phoneNumbers[i], message);
+  }
+}
+
+void sendAlert(String number, String message) {
+  Serial.println("Sending alert to: " + number);
+  Serial.println("Message content:\n" + message);
+  
+  gsmSerial.println("AT+CMGF=1");
+  delay(500);
+  gsmSerial.println("AT+CMGS=\"" + number + "\"");
+  delay(500);
+  gsmSerial.print(message);
+  delay(500);
+  gsmSerial.write(26); // CTRL+Z to send
+  delay(2000);
+  
+  // Check if message was sent successfully
+  while (gsmSerial.available()) {
+    String response = gsmSerial.readString();
+    Serial.println("GSM Response: " + response);
+  }
+}
+
+// Other functions remain the same as your original code
+void checkDeviceStatus() {
+  bool status = (digitalRead(IR_SENSOR_PIN) == LOW);
+  
+  if (status != deviceWorn) {
+    deviceWorn = status;
+    if (deviceWorn) {
+      Serial.println("\nDevice detected on wrist!");
+      Serial.println("Starting monitoring...");
+    } else {
+      Serial.println("\nDevice removed - Monitoring paused");
+      emergencyTriggered = false;
+      digitalWrite(LED_PIN, LOW);
+      noTone(BUZZER_PIN);
+    }
+  }
+}
+
+void readAllSensors() {
+  readVitals();
+  readEnvironment();
+  checkMovement();
+}
+
+void readVitals() {
+  long irValue = particleSensor.getIR();
+  
+  if (checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+    beatsPerMinute = 60 / (delta / 1000.0);
+    
+    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE;
+      beatAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+      beatAvg /= RATE_SIZE;
+    }
+  }
+  
+  // SPO2 Calculation
+  long redValue = particleSensor.getRed();
+  if (irValue > 50000 && redValue > 0) {
+    float ratio = (float)redValue / (float)irValue;
+    spo2Value = 110.0 - (ratio * 25.0);
+    spo2Value = constrain(spo2Value, 70, 100);
+  } else {
+    spo2Value = 0;
+  }
+}
+
+void readEnvironment() {
+  currentTemp = dht.readTemperature();
+  currentHumidity = dht.readHumidity();
+}
+
+void checkMovement() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  float totalAccel = sqrt(a.acceleration.x*a.acceleration.x + 
+                        a.acceleration.y*a.acceleration.y + 
+                        a.acceleration.z*a.acceleration.z);
+  
+  if (totalAccel > FALL_THRESHOLD) {
+    triggerEmergency("Fall Detected");
+  }
+}
+
+void displayReadings() {
+  Serial.println("\n============== CURRENT READINGS ==============");
+  
+  // Health Data
+  Serial.println("HEALTH METRICS:");
+  Serial.print(" Heart Rate: ");
+  if (beatsPerMinute > 0) Serial.print(beatsPerMinute); else Serial.print("--");
+  Serial.print(" BPM (Avg: ");
+  Serial.print(beatAvg);
+  Serial.println(")");
+  
+  Serial.print(" SpO2: ");
+  if (spo2Value > 0) Serial.print(spo2Value); else Serial.print("--");
+  Serial.println(" %");
+
+  // Environment Data
+  Serial.println("\nENVIRONMENT:");
+  Serial.print(" Temperature: ");
+  if (!isnan(currentTemp)) Serial.print(currentTemp); else Serial.print("--");
+  Serial.println(" °C");
+  
+  Serial.print(" Humidity: ");
+  if (!isnan(currentHumidity)) Serial.print(currentHumidity); else Serial.print("--");
+  Serial.println(" %");
+
+  // GPS Data
+  Serial.println("\nLOCATION:");
+  if (gpsValid) {
+    Serial.print(" Latitude: "); Serial.println(gpsLatitude, 6);
+    Serial.print(" Longitude: "); Serial.println(gpsLongitude, 6);
+    Serial.print(" Google Maps: "); Serial.println(googleMapsLink);
+  } else {
+    Serial.println(" GPS signal not available");
+  }
+
+  // Motion Data
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  Serial.println("\nMOTION:");
+  Serial.print(" Accel - X:"); Serial.print(a.acceleration.x);
+  Serial.print(" Y:"); Serial.print(a.acceleration.y);
+  Serial.print(" Z:"); Serial.println(a.acceleration.z);
+
+  Serial.println("==========================================");
+}
+
+void handleEmergency() {
+  static unsigned long lastAlert = 0;
+  if (millis() - lastAlert >= 500) {
+    lastAlert = millis();
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    tone(BUZZER_PIN, 2000, 300);
+  }
+}
+
+void testAlerts() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 2000, 300);
+    delay(500);
+    digitalWrite(LED_PIN, LOW);
+    delay(300);
+  }
+}
